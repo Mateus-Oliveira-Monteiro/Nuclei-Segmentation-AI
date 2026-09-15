@@ -1,6 +1,17 @@
 venv/
+.venv/
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 *.dll
+.DS_Store
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Temporary uploads and cache
+uploads/
+*.tmp

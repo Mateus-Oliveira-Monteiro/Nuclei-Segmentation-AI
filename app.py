@@ -1,16 +1,22 @@
-"""
-API Flask para Segmentação de Núcleos usando StarDist
-"""
+from dotenv import load_dotenv
+load_dotenv()
 
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import os
+import uuid
+import tempfile
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')  # Backend não-interativo para servidores
 import matplotlib.pyplot as plt
 from io import BytesIO
 import base64
+import hmac
+import hashlib
+import time
+from functools import wraps
+from PIL import Image
 
 from tifffile import imread
 from skimage import color
@@ -21,9 +27,56 @@ from stardist import random_label_cmap
 from csbdeep.data import Normalizer, normalize_mi_ma
 import pandas as pd
 
+import azure_storage
+
 # Configuração
 app = Flask(__name__)
 CORS(app)
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50 MB
+
+# Configurações de Segurança e Senha de Acesso
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123").strip()
+SECRET_KEY = os.getenv("SECRET_KEY", "nuclei-secret-salt-key-2026").strip()
+
+def generate_token():
+    """Gera um token assinado com timestamp para a sessão do usuário."""
+    timestamp = str(int(time.time()))
+    sig = hmac.new(SECRET_KEY.encode('utf-8'), f"{ADMIN_PASSWORD}:{timestamp}".encode('utf-8'), hashlib.sha256).hexdigest()
+    return f"{timestamp}:{sig}"
+
+def verify_token(token, max_age_seconds=7 * 24 * 3600):
+    """Valida a assinatura do token e verifica se não expirou (padrão: 7 dias)."""
+    if not token or ':' not in token:
+        return False
+    try:
+        timestamp_str, sig = token.split(':', 1)
+        timestamp = int(timestamp_str)
+        if time.time() - timestamp > max_age_seconds:
+            return False
+        expected_sig = hmac.new(SECRET_KEY.encode('utf-8'), f"{ADMIN_PASSWORD}:{timestamp_str}".encode('utf-8'), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(sig, expected_sig)
+    except Exception:
+        return False
+
+def require_auth(f):
+    """Decorator para proteger endpoints restritos."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth_header = request.headers.get('Authorization', '')
+        token = ''
+        if auth_header.startswith('Bearer '):
+            token = auth_header[7:].strip()
+        if not verify_token(token):
+            return jsonify({'error': 'Acesso não autorizado. Faça login para continuar.'}), 401
+        return f(*args, **kwargs)
+    return decorated
+
+ALLOWED_EXTENSIONS = {'tif', 'tiff', 'png', 'jpg', 'jpeg'}
+
+@app.errorhandler(413)
+def request_entity_too_large(error):
+    return jsonify({'error': 'Arquivo muito grande. O limite máximo permitido é 50 MB.'}), 413
+
 
 IMAGE_FOLDER = "tiff images"
 RESULTS_FOLDER = "static/results"
@@ -38,6 +91,7 @@ AVAILABLE_IMAGES = {
     "Campo 3": "Campo 3.tif",
     "Campo 3R": "Campo 3R.tif",
 }
+
 
 # Carregar modelo uma vez na inicialização
 print("=" * 50)
@@ -62,6 +116,32 @@ class MyNormalizer(Normalizer):
     @property
     def do_after(self):
         return False
+
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+def load_image_as_numpy(filepath_or_file, filename):
+    """
+    Carrega imagens nos formatos TIFF, PNG, JPG, JPEG e retorna como array NumPy (Y, X, C).
+    """
+    ext = filename.rsplit('.', 1)[1].lower() if '.' in filename else ''
+    if ext in ['tif', 'tiff']:
+        img = imread(filepath_or_file)
+    else:
+        pil_img = Image.open(filepath_or_file)
+        if pil_img.mode != 'RGB':
+            pil_img = pil_img.convert('RGB')
+        img = np.array(pil_img)
+    
+    # Normaliza dimensões caso a imagem seja 2D (escala de cinza) ou 4D (RGBA)
+    if img.ndim == 2:
+        img = np.stack([img] * 3, axis=-1)
+    elif img.ndim == 3 and img.shape[-1] == 4:
+        img = img[..., :3]
+        
+    return img
 
 
 def generate_result_image(img_gray, labels, output_path):
@@ -111,11 +191,35 @@ def health():
     return jsonify({
         'status': 'ok',
         'model_loaded': True,
+        'azure_storage_configured': azure_storage.is_azure_configured(),
         'available_images': list(AVAILABLE_IMAGES.keys())
     })
 
 
+@app.route('/api/login', methods=['POST'])
+def login():
+    """Valida a senha de acesso e retorna o token de autenticação."""
+    data = request.get_json() or {}
+    password = data.get('password', '')
+    if not password or not hmac.compare_digest(password, ADMIN_PASSWORD):
+        return jsonify({'error': 'Senha incorreta. Tente novamente.'}), 401
+    
+    token = generate_token()
+    return jsonify({'success': True, 'token': token})
+
+
+@app.route('/api/verify-token', methods=['GET'])
+def verify_session():
+    """Verifica se o token da sessão atual é válido."""
+    auth_header = request.headers.get('Authorization', '')
+    token = auth_header[7:].strip() if auth_header.startswith('Bearer ') else ''
+    if verify_token(token):
+        return jsonify({'valid': True})
+    return jsonify({'valid': False, 'error': 'Token inválido ou expirado'}), 401
+
+
 @app.route('/api/images', methods=['GET'])
+@require_auth
 def list_images():
     """Lista as imagens disponíveis para análise."""
     images = []
@@ -132,7 +236,9 @@ def list_images():
 
 
 @app.route('/api/segment', methods=['POST'])
+@require_auth
 def segment():
+
     """
     Realiza a segmentação de núcleos na imagem selecionada.
     
@@ -216,14 +322,25 @@ def segment():
         ])
         df = pd.DataFrame(props)
         
-        # Gerar imagens de resultado
+        # Gerar imagens de resultado e CSV
         safe_name = image_name.lower().replace(" ", "_")
-        result_image_path = os.path.join(RESULTS_FOLDER, f"{safe_name}_result.png")
-        histogram_path = os.path.join(RESULTS_FOLDER, f"{safe_name}_histogram.png")
+        result_filename = f"{safe_name}_result.png"
+        histogram_filename = f"{safe_name}_histogram.png"
+        csv_filename = f"{safe_name}_nuclei.csv"
+        
+        result_local_path = os.path.join(RESULTS_FOLDER, result_filename)
+        histogram_local_path = os.path.join(RESULTS_FOLDER, histogram_filename)
         
         print("Gerando visualizações...")
-        generate_result_image(img_gray, labels, result_image_path)
-        generate_histogram(df['area'].values, histogram_path)
+        generate_result_image(img_gray, labels, result_local_path)
+        generate_histogram(df['area'].values, histogram_local_path)
+        
+        # Upload para Azure Blob Storage (ou fallback local)
+        result_image_url = azure_storage.upload_file(result_local_path, result_filename, content_type='image/png')
+        histogram_url = azure_storage.upload_file(histogram_local_path, histogram_filename, content_type='image/png')
+        
+        csv_bytes = df.to_csv(index=False).encode('utf-8')
+        csv_download_url = azure_storage.upload_bytes(csv_bytes, csv_filename, content_type='text/csv')
         
         print("Concluído!")
         print(f"{'='*50}\n")
@@ -234,16 +351,17 @@ def segment():
             'image_name': image_name,
             'nuclei_count': nuclei_count,
             'statistics': {
-                'mean_area': round(float(df['area'].mean()), 2),
-                'median_area': round(float(df['area'].median()), 2),
-                'min_area': int(df['area'].min()),
-                'max_area': int(df['area'].max()),
-                'std_area': round(float(df['area'].std()), 2),
-                'mean_solidity': round(float(df['solidity'].mean()), 4),
-                'mean_diameter': round(float(df['equivalent_diameter'].mean()), 2),
+                'mean_area': round(float(df['area'].mean()), 2) if len(df) > 0 else 0,
+                'median_area': round(float(df['area'].median()), 2) if len(df) > 0 else 0,
+                'min_area': int(df['area'].min()) if len(df) > 0 else 0,
+                'max_area': int(df['area'].max()) if len(df) > 0 else 0,
+                'std_area': round(float(df['area'].std()), 2) if len(df) > 0 else 0,
+                'mean_solidity': round(float(df['solidity'].mean()), 4) if len(df) > 0 else 0,
+                'mean_diameter': round(float(df['equivalent_diameter'].mean()), 2) if len(df) > 0 else 0,
             },
-            'result_image_url': f"/{result_image_path}",
-            'histogram_url': f"/{histogram_path}",
+            'result_image_url': result_image_url,
+            'histogram_url': histogram_url,
+            'csv_download_url': csv_download_url,
             # Enviar apenas os primeiros 100 núcleos para não sobrecarregar
             'nuclei_data': df.head(100).to_dict(orient='records')
         }
@@ -257,15 +375,158 @@ def segment():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/upload-and-segment', methods=['POST'])
+@require_auth
+def upload_and_segment():
+
+    """
+    Recebe uma imagem enviada pelo usuário (TIFF, PNG, JPG, JPEG),
+    executa a segmentação de núcleos com StarDist, gera métricas e gráficos,
+    armazena os resultados no Azure Blob Storage (ou fallback local),
+    e remove imediatamente a imagem original do servidor.
+    """
+    if 'file' not in request.files:
+        return jsonify({'error': 'Nenhum arquivo enviado no campo "file"'}), 400
+        
+    file = request.files['file']
+    
+    if not file or file.filename == '':
+        return jsonify({'error': 'Nome de arquivo inválido ou vazio'}), 400
+        
+    if not allowed_file(file.filename):
+        allowed_str = ', '.join(sorted(ALLOWED_EXTENSIONS))
+        return jsonify({'error': f'Formato de arquivo não suportado. Formatos aceitos: {allowed_str}'}), 400
+        
+    temp_filepath = None
+    try:
+        # Gerar identificador único
+        file_id = uuid.uuid4().hex[:10]
+        _, ext = os.path.splitext(file.filename)
+        
+        # Salvar em arquivo temporário
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_file:
+            file.save(temp_file.name)
+            temp_filepath = temp_file.name
+            
+        print(f"\n{'='*50}")
+        print(f"Processando arquivo de upload: {file.filename} (ID: {file_id})")
+        print(f"{'='*50}")
+        
+        # Carregar imagem como matriz NumPy
+        print("Carregando imagem...")
+        img = load_image_as_numpy(temp_filepath, file.filename)
+        img_gray = color.rgb2gray(img)
+        print(f"Dimensões: {img.shape}")
+        
+        # Configurar predição em blocos
+        normalizer = MyNormalizer(0, 255)
+        block_size = min(img.shape[0], img.shape[1], 4096)
+        min_overlap = int(block_size * 0.1)
+        context = int(block_size * 0.1)
+        
+        # Predição com StarDist
+        print("Realizando segmentação StarDist...")
+        labels, polys = model.predict_instances_big(
+            img,
+            axes="YXC",
+            block_size=block_size,
+            min_overlap=min_overlap,
+            context=context,
+            normalizer=normalizer,
+            n_tiles=(4, 4, 1),
+        )
+        
+        nuclei_count = int(labels.max())
+        print(f"Núcleos detectados: {nuclei_count}")
+        
+        # Cálculo de propriedades morfométricas
+        print("Calculando propriedades morfométricas...")
+        props = regionprops_table(labels, img, properties=[
+            'label', 'area', 'equivalent_diameter', 'solidity', 'centroid'
+        ])
+        df = pd.DataFrame(props)
+        
+        # Nomes dos arquivos de saída
+        result_filename = f"{file_id}_result.png"
+        histogram_filename = f"{file_id}_histogram.png"
+        csv_filename = f"{file_id}_nuclei_data.csv"
+        
+        result_local_path = os.path.join(RESULTS_FOLDER, result_filename)
+        histogram_local_path = os.path.join(RESULTS_FOLDER, histogram_filename)
+        
+        # Gerar visualizações
+        print("Gerando gráficos e overlay...")
+        generate_result_image(img_gray, labels, result_local_path)
+        generate_histogram(df['area'].values, histogram_local_path)
+        
+        # Enviar saídas para Azure Blob Storage ou disco local
+        result_image_url = azure_storage.upload_file(result_local_path, result_filename, content_type='image/png')
+        histogram_url = azure_storage.upload_file(histogram_local_path, histogram_filename, content_type='image/png')
+        
+        csv_bytes = df.to_csv(index=False).encode('utf-8')
+        csv_download_url = azure_storage.upload_bytes(csv_bytes, csv_filename, content_type='text/csv')
+        
+        print("Processamento concluído com sucesso!")
+        print(f"{'='*50}\n")
+        
+        # Resposta JSON
+        response = {
+            'success': True,
+            'image_name': file.filename,
+            'file_id': file_id,
+            'nuclei_count': nuclei_count,
+            'statistics': {
+                'mean_area': round(float(df['area'].mean()), 2) if len(df) > 0 else 0,
+                'median_area': round(float(df['area'].median()), 2) if len(df) > 0 else 0,
+                'min_area': int(df['area'].min()) if len(df) > 0 else 0,
+                'max_area': int(df['area'].max()) if len(df) > 0 else 0,
+                'std_area': round(float(df['area'].std()), 2) if len(df) > 0 else 0,
+                'mean_solidity': round(float(df['solidity'].mean()), 4) if len(df) > 0 else 0,
+                'mean_diameter': round(float(df['equivalent_diameter'].mean()), 2) if len(df) > 0 else 0,
+            },
+            'result_image_url': result_image_url,
+            'histogram_url': histogram_url,
+            'csv_download_url': csv_download_url,
+            'nuclei_data': df.head(100).to_dict(orient='records')
+        }
+        
+        return jsonify(response)
+        
+    except Exception as e:
+        print(f"Erro no processamento do upload: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+        
+    finally:
+        # Exclusão imediata da imagem original enviada
+        if temp_filepath and os.path.exists(temp_filepath):
+            try:
+                os.remove(temp_filepath)
+                print(f"Arquivo temporário de entrada excluído: {temp_filepath}")
+            except Exception as cleanup_err:
+                print(f"Aviso ao remover arquivo temporário: {cleanup_err}")
+
+
 @app.route('/static/results/<path:filename>')
 def serve_result(filename):
-    """Serve as imagens de resultado geradas."""
-    return send_from_directory(RESULTS_FOLDER, filename)
+    """Serve as imagens de resultado geradas (com suporte a download forçado)."""
+    as_attachment = request.args.get('download', 'false').lower() == 'true'
+    return send_from_directory(RESULTS_FOLDER, filename, as_attachment=as_attachment)
+
+
+@app.route('/api/download/<path:filename>', methods=['GET'])
+def download_result_file(filename):
+    """Rota utilitária para forçar o download de arquivos de resultado (CSV ou PNG)."""
+    return send_from_directory(RESULTS_FOLDER, filename, as_attachment=True)
+
 
 
 # Endpoint alternativo que retorna imagem como Base64 (opcional)
 @app.route('/api/segment-base64', methods=['POST'])
+@require_auth
 def segment_base64():
+
     """
     Mesmo que /api/segment, mas retorna as imagens como Base64.
     Útil se não quiser servir arquivos estáticos.
