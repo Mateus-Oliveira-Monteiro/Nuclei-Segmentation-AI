@@ -296,21 +296,34 @@ def segment():
         
         # Configurar predição
         normalizer = MyNormalizer(0, 255)
-        block_size = min(img.shape[0], img.shape[1], 4096)
-        min_overlap = int(block_size * 0.1)
-        context = int(block_size * 0.1)
+        h, w = img.shape[0], img.shape[1]
         
-        # Realizar predição
-        print("Realizando segmentação (isso pode demorar)...")
-        labels, polys = model.predict_instances_big(
-            img,
-            axes="YXC",
-            block_size=block_size,
-            min_overlap=min_overlap,
-            context=context,
-            normalizer=normalizer,
-            n_tiles=(4, 4, 1),
-        )
+        # Usar predict_instances_big apenas para imagens realmente grandes (>= 1024px)
+        # Para imagens menores, predict_instances padrão é mais estável
+        USE_BIG_THRESHOLD = 1024
+        if h >= USE_BIG_THRESHOLD or w >= USE_BIG_THRESHOLD:
+            block_size = min(h, w, 4096)
+            min_overlap = max(32, int(block_size * 0.1))
+            context = max(32, int(block_size * 0.1))
+            # Garantir que block_size > min_overlap + 2*context
+            while min_overlap + 2 * context >= block_size and block_size > 64:
+                min_overlap = max(16, min_overlap // 2)
+                context = max(16, context // 2)
+            print(f"Segmentação em blocos: block_size={block_size}, min_overlap={min_overlap}, context={context}")
+            print("Realizando segmentação (isso pode demorar)...")
+            labels, polys = model.predict_instances_big(
+                img,
+                axes="YXC",
+                block_size=block_size,
+                min_overlap=min_overlap,
+                context=context,
+                normalizer=normalizer,
+                n_tiles=(2, 2, 1),
+            )
+        else:
+            print(f"Imagem pequena ({h}x{w}), usando predict_instances padrão...")
+            labels, polys = model.predict_instances(img, normalizer=normalizer)
+
         
         nuclei_count = int(labels.max())
         print(f"Núcleos detectados: {nuclei_count}")
@@ -420,21 +433,36 @@ def upload_and_segment():
         
         # Configurar predição em blocos
         normalizer = MyNormalizer(0, 255)
-        block_size = min(img.shape[0], img.shape[1], 4096)
-        min_overlap = int(block_size * 0.1)
-        context = int(block_size * 0.1)
+        h, w = img.shape[0], img.shape[1]
+        
+        # Usar predict_instances_big apenas para imagens realmente grandes (>= 1024px)
+        # Para imagens menores, predict_instances padrão é mais estável
+        USE_BIG_THRESHOLD = 1024
         
         # Predição com StarDist
         print("Realizando segmentação StarDist...")
-        labels, polys = model.predict_instances_big(
-            img,
-            axes="YXC",
-            block_size=block_size,
-            min_overlap=min_overlap,
-            context=context,
-            normalizer=normalizer,
-            n_tiles=(4, 4, 1),
-        )
+        if h >= USE_BIG_THRESHOLD or w >= USE_BIG_THRESHOLD:
+            block_size = min(h, w, 4096)
+            min_overlap = max(32, int(block_size * 0.1))
+            context = max(32, int(block_size * 0.1))
+            # Garantir que block_size > min_overlap + 2*context
+            while min_overlap + 2 * context >= block_size and block_size > 64:
+                min_overlap = max(16, min_overlap // 2)
+                context = max(16, context // 2)
+            print(f"Segmentação em blocos: block_size={block_size}, min_overlap={min_overlap}, context={context}")
+            labels, polys = model.predict_instances_big(
+                img,
+                axes="YXC",
+                block_size=block_size,
+                min_overlap=min_overlap,
+                context=context,
+                normalizer=normalizer,
+                n_tiles=(2, 2, 1),
+            )
+        else:
+            print(f"Imagem pequena ({h}x{w}), usando predict_instances padrão...")
+            labels, polys = model.predict_instances(img, normalizer=normalizer)
+
         
         nuclei_count = int(labels.max())
         print(f"Núcleos detectados: {nuclei_count}")
