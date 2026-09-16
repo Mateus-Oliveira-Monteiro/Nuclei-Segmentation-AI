@@ -13,7 +13,7 @@ Principais capacidades:
 1. A imagem TIFF e carregada do diretorio local.
 2. A versao em escala de cinza e usada para visualizacao.
 3. A normalizacao de intensidades e aplicada via `MyNormalizer`.
-4. A segmentacao roda em blocos (`predict_instances_big`) para lidar com imagens grandes.
+4. A segmentacao usa `predict_instances` com `n_tiles` calculado automaticamente para lidar com imagens grandes.
 5. As propriedades dos nucleos sao calculadas com `regionprops_table`.
 6. As visualizacoes sao salvas em `static/results`.
 7. A API retorna JSON com contagem, estatisticas e uma amostra de nucleos.
@@ -114,7 +114,7 @@ O script gera o arquivo `nuclei_analysis_results.csv` com as propriedades dos nu
 
 ## Ajustes comuns
 - Adicionar imagens: coloque arquivos TIFF em `tiff images/` e atualize `AVAILABLE_IMAGES`.
-- Ajustar desempenho: altere `block_size`, `min_overlap` e `n_tiles`.
+- Ajustar desempenho: altere `PREDICTION_TILE_SIZE` em `app.py`.
 - Ajustar quantidade de dados retornados: modifique `df.head(100)`.
 
 ## Observacoes de deploy

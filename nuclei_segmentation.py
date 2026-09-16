@@ -78,21 +78,21 @@ class MyNormalizer(Normalizer):
 mi, ma = 0, 255
 normalizer = MyNormalizer(mi, ma)
 
-# Calcular block_size, min_overlap e context baseado no tamanho da imagem
+# Calcular automaticamente a quantidade de tiles 2D conforme o tamanho da imagem
 print("\nIniciando predição (isso pode demorar alguns minutos)...")
-block_size = min(img.shape[0], img.shape[1], 4096)
-min_overlap = int(block_size * 0.1)
-context = int(block_size * 0.1)
+tile_size = 1024
+n_tiles = (
+    max(1, int(np.ceil(img.shape[0] / tile_size))),
+    max(1, int(np.ceil(img.shape[1] / tile_size))),
+    1,
+)
 
 # Realizar predição
-labels, polys = model.predict_instances_big(
+labels, _ = model.predict_instances(
     img,
     axes="YXC",
-    block_size=block_size,
-    min_overlap=min_overlap,
-    context=context,
     normalizer=normalizer,
-    n_tiles=(4, 4, 1),
+    n_tiles=n_tiles,
 )
 print(f"Predição concluída! Foram detectados {labels.max()} núcleos.")
 

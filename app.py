@@ -118,6 +118,19 @@ class MyNormalizer(Normalizer):
         return False
 
 
+PREDICTION_TILE_SIZE = 1024
+
+
+def get_prediction_tiles(image_shape):
+    """Calcula a quantidade de tiles 2D conforme o tamanho da imagem."""
+    height, width = image_shape[:2]
+    return (
+        max(1, int(np.ceil(height / PREDICTION_TILE_SIZE))),
+        max(1, int(np.ceil(width / PREDICTION_TILE_SIZE))),
+        1,
+    )
+
+
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
@@ -294,35 +307,16 @@ def segment():
         
         print(f"Dimensões: {img.shape}")
         
-        # Configurar predição
+        # Configurar predição em tiles para controlar o uso de memória
         normalizer = MyNormalizer(0, 255)
-        h, w = img.shape[0], img.shape[1]
-        
-        # Usar predict_instances_big apenas para imagens realmente grandes (>= 1024px)
-        # Para imagens menores, predict_instances padrão é mais estável
-        USE_BIG_THRESHOLD = 1024
-        if h >= USE_BIG_THRESHOLD or w >= USE_BIG_THRESHOLD:
-            block_size = min(h, w, 4096)
-            min_overlap = max(32, int(block_size * 0.1))
-            context = max(32, int(block_size * 0.1))
-            # Garantir que block_size > min_overlap + 2*context
-            while min_overlap + 2 * context >= block_size and block_size > 64:
-                min_overlap = max(16, min_overlap // 2)
-                context = max(16, context // 2)
-            print(f"Segmentação em blocos: block_size={block_size}, min_overlap={min_overlap}, context={context}")
-            print("Realizando segmentação (isso pode demorar)...")
-            labels, polys = model.predict_instances_big(
-                img,
-                axes="YXC",
-                block_size=block_size,
-                min_overlap=min_overlap,
-                context=context,
-                normalizer=normalizer,
-                n_tiles=(2, 2, 1),
-            )
-        else:
-            print(f"Imagem pequena ({h}x{w}), usando predict_instances padrão...")
-            labels, polys = model.predict_instances(img, normalizer=normalizer)
+        n_tiles = get_prediction_tiles(img.shape)
+        print(f"Realizando segmentação com tiles: n_tiles={n_tiles}...")
+        labels, _ = model.predict_instances(
+            img,
+            axes="YXC",
+            normalizer=normalizer,
+            n_tiles=n_tiles,
+        )
 
         
         nuclei_count = int(labels.max())
@@ -431,37 +425,18 @@ def upload_and_segment():
         img_gray = color.rgb2gray(img)
         print(f"Dimensões: {img.shape}")
         
-        # Configurar predição em blocos
+        # Configurar predição em tiles para controlar o uso de memória
         normalizer = MyNormalizer(0, 255)
-        h, w = img.shape[0], img.shape[1]
-        
-        # Usar predict_instances_big apenas para imagens realmente grandes (>= 1024px)
-        # Para imagens menores, predict_instances padrão é mais estável
-        USE_BIG_THRESHOLD = 1024
-        
+        n_tiles = get_prediction_tiles(img.shape)
+
         # Predição com StarDist
-        print("Realizando segmentação StarDist...")
-        if h >= USE_BIG_THRESHOLD or w >= USE_BIG_THRESHOLD:
-            block_size = min(h, w, 4096)
-            min_overlap = max(32, int(block_size * 0.1))
-            context = max(32, int(block_size * 0.1))
-            # Garantir que block_size > min_overlap + 2*context
-            while min_overlap + 2 * context >= block_size and block_size > 64:
-                min_overlap = max(16, min_overlap // 2)
-                context = max(16, context // 2)
-            print(f"Segmentação em blocos: block_size={block_size}, min_overlap={min_overlap}, context={context}")
-            labels, polys = model.predict_instances_big(
-                img,
-                axes="YXC",
-                block_size=block_size,
-                min_overlap=min_overlap,
-                context=context,
-                normalizer=normalizer,
-                n_tiles=(2, 2, 1),
-            )
-        else:
-            print(f"Imagem pequena ({h}x{w}), usando predict_instances padrão...")
-            labels, polys = model.predict_instances(img, normalizer=normalizer)
+        print(f"Realizando segmentação StarDist com tiles: n_tiles={n_tiles}...")
+        labels, _ = model.predict_instances(
+            img,
+            axes="YXC",
+            normalizer=normalizer,
+            n_tiles=n_tiles,
+        )
 
         
         nuclei_count = int(labels.max())
@@ -580,16 +555,13 @@ def segment_base64():
         img_gray = color.rgb2gray(img)
         
         normalizer = MyNormalizer(0, 255)
-        block_size = min(img.shape[0], img.shape[1], 4096)
-        
-        labels, polys = model.predict_instances_big(
+        n_tiles = get_prediction_tiles(img.shape)
+
+        labels, _ = model.predict_instances(
             img,
             axes="YXC",
-            block_size=block_size,
-            min_overlap=int(block_size * 0.1),
-            context=int(block_size * 0.1),
             normalizer=normalizer,
-            n_tiles=(4, 4, 1),
+            n_tiles=n_tiles,
         )
         
         # Gerar imagem em memória
